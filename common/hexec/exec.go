@@ -104,6 +104,7 @@ func New(cfg security.Config, workingDir string, log loggers.Logger) *Exec {
 		infol:           log.InfoCommand("exec"),
 		baseEnviron:     baseEnviron,
 		nodeRunnerCache: maps.NewCache[string, func(arg ...any) (Runner, error)](),
+		readPathChecks:  maps.NewCacheWithOptions[string, bool](maps.CacheOptions{Size: 10000}),
 	}
 }
 
@@ -126,6 +127,9 @@ type Exec struct {
 	nodeReadPaths []string
 
 	nodeRunnerCache *maps.Cache[string, func(arg ...any) (Runner, error)]
+
+	// Filenames already accepted by CheckReadPath.
+	readPathChecks *maps.Cache[string, bool]
 }
 
 // SetNodeReadPaths sets additional absolute paths to allow reading from
@@ -267,13 +271,7 @@ func (e *Exec) nodePermissionArgs(name, scriptPath string) []string {
 
 	args := []string{"--permission"}
 
-	for _, p := range e.resolveNodePermPaths(perms.AllowRead) {
-		args = append(args, "--allow-fs-read="+p)
-	}
-	for _, p := range e.nodeReadPaths {
-		args = append(args, "--allow-fs-read="+p)
-	}
-	if p := nodeScriptReadPath(scriptPath); p != "" {
+	for _, p := range e.nodeReadRoots(scriptPath) {
 		args = append(args, "--allow-fs-read="+p)
 	}
 
@@ -304,6 +302,58 @@ func (e *Exec) nodePermissionArgs(name, scriptPath string) []string {
 	}
 
 	return args
+}
+
+func (e *Exec) nodeReadRoots(scriptPath string) []string {
+	roots := e.resolveNodePermPaths(e.sc.Node.Permissions.AllowRead)
+	roots = append(roots, e.nodeReadPaths...)
+	if p := nodeScriptReadPath(scriptPath); p != "" {
+		roots = append(roots, p)
+	}
+	return roots
+}
+
+// CheckReadPath fails if filename resolves outside the allowRead roots.
+// Used by in-process tools (e.g. the Sass transpilers) that read files on their own,
+// so they get the same boundary as the Node.js tools.
+func (e *Exec) CheckReadPath(filename string) error {
+	_, err := e.readPathChecks.GetOrCreate(filename, func() (bool, error) {
+		roots := e.nodeReadRoots("")
+		if slices.Contains(roots, "*") {
+			return true, nil
+		}
+		target, err := filepath.EvalSymlinks(filename)
+		if err != nil {
+			return false, err
+		}
+		if target, err = filepath.Abs(target); err != nil {
+			return false, err
+		}
+		if !isBelowAny(target, evalSymlinks(roots)) {
+			return false, fmt.Errorf("%q resolves to %q outside the project; only files below the working directory or the paths in security.node.permissions.allowRead can be imported", filename, target)
+		}
+		return true, nil
+	})
+	return err
+}
+
+// evalSymlinks resolves paths, dropping the ones that cannot be resolved.
+func evalSymlinks(paths []string) []string {
+	var real []string
+	for _, p := range paths {
+		if p, err := filepath.EvalSymlinks(p); err == nil {
+			real = append(real, p)
+		}
+	}
+	return real
+}
+
+func isBelowAny(p string, dirs []string) bool {
+	return slices.ContainsFunc(dirs, func(d string) bool { return isBelow(p, d) })
+}
+
+func isBelow(p, dir string) bool {
+	return p == dir || strings.HasPrefix(p, strings.TrimSuffix(dir, string(filepath.Separator))+string(filepath.Separator))
 }
 
 // resolveNodePermPaths resolves relative paths against the working directory.

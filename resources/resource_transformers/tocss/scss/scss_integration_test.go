@@ -14,7 +14,9 @@
 package scss_test
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -36,11 +38,14 @@ func TestTransformIncludePaths(t *testing.T) {
 -- assets/scss/main.scss --
 @import "moo";
 -- node_modules/foo/_moo.scss --
-$moolor: #fff;
+@import "sub/bar";
+$moolor: $barcolor;
 
 moo {
   color: $moolor;
 }
+-- node_modules/foo/sub/_bar.scss --
+$barcolor: #fff;
 -- config.toml --
 -- layouts/index.html --
 {{ $cssOpts := (dict "includePaths" (slice "node_modules/foo") ) }}
@@ -461,4 +466,187 @@ target = "assets/sass"
 		}).Build()
 
 	b.AssertFileContent("public/index.html", ".foo1{color:red}.bar1{color:blue}.foo2{color:red}.bar2{color:blue}")
+}
+
+// Imports not found in Hugo's file systems used to be resolved by the Sass compiler
+// itself, following symlinks and with no notion of the project boundary.
+func TestTransformImportOutsideProject(t *testing.T) {
+	if !scss.Supports() {
+		t.Skip()
+	}
+	c := qt.New(t)
+
+	base := t.TempDir()
+	secret := filepath.Join(base, "secret.scss")
+	c.Assert(os.WriteFile(secret, []byte(`.pwn { content: "PWN-SECRET"; }`), 0o644), qt.IsNil)
+
+	files := `
+-- hugo.toml --
+disableKinds = ["taxonomy", "term", "rss", "sitemap", "robotsTXT", "section", "page"]
+theme = "mytheme"
+SECURITY
+-- themes/mytheme/hugo.toml --
+-- themes/mytheme/assets/css/main.scss --
+@import "IMPORT";
+-- layouts/all.html --
+{{ $css := resources.Get "css/main.scss" | css.Sass (dict "transpiler" "libsass") }}
+RESULT:<pre>{{ $css.Content }}</pre>
+`
+
+	build := func(c *qt.C, name, imp, security string) (*hugolib.IntegrationTestBuilder, error) {
+		workingDir := filepath.Join(base, name)
+		if runtime.GOOS != "windows" {
+			linkDir := filepath.Join(workingDir, "themes", "mytheme", "assets", "css")
+			c.Assert(os.MkdirAll(linkDir, 0o755), qt.IsNil)
+			c.Assert(os.Symlink(secret, filepath.Join(linkDir, "link.scss")), qt.IsNil)
+		}
+		f := strings.ReplaceAll(files, "IMPORT", imp)
+		f = strings.ReplaceAll(f, "SECURITY", security)
+		return hugolib.NewIntegrationTestBuilder(
+			hugolib.IntegrationTestConfig{
+				T:           c,
+				TxtarString: f,
+				NeedsOsFS:   true,
+				WorkingDir:  workingDir,
+			},
+		).BuildE()
+	}
+
+	const outsideErr = `.*"[^"]*\.scss" resolves to "[^"]*secret.scss" outside the project.*allowRead.*`
+
+	c.Run("Relative import", func(c *qt.C) {
+		_, err := build(c, "relative", "../../../../../secret", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr)
+	})
+
+	c.Run("Symlink in theme", func(c *qt.C) {
+		if runtime.GOOS == "windows" {
+			c.Skip("symlinks")
+		}
+		_, err := build(c, "symlink", "link", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr)
+	})
+
+	c.Run("Absolute import", func(c *qt.C) {
+		_, err := build(c, "absolute", filepath.ToSlash(filepath.Join(base, "secret")), "")
+		c.Assert(err, qt.ErrorMatches, outsideErr)
+	})
+
+	c.Run("Relative import, target in allowRead", func(c *qt.C) {
+		b, err := build(c, "allowed", "../../../../../secret", `
+[security.node.permissions]
+allowRead = [".", ".."]
+`)
+		c.Assert(err, qt.IsNil)
+		b.AssertFileContent("public/index.html", "PWN-SECRET")
+	})
+}
+
+// LibSASS also resolves imports on its own that Hugo does not, e.g. the name as given,
+// .css files and .css index files, and imports from files it resolved itself. These
+// must not reach files outside the project either.
+func TestTransformImportOutsideProjectLibSassCandidates(t *testing.T) {
+	if !scss.Supports() {
+		t.Skip()
+	}
+	c := qt.New(t)
+
+	base := t.TempDir()
+	write := func(name, content string) string {
+		filename := filepath.Join(base, filepath.FromSlash(name))
+		c.Assert(os.MkdirAll(filepath.Dir(filename), 0o755), qt.IsNil)
+		c.Assert(os.WriteFile(filename, []byte(content), 0o644), qt.IsNil)
+		return filename
+	}
+	secretCSS := write("secretcss.css", `.pwn { content: "PWN-SECRET-CSS"; }`)
+	write("secretnoext", `.pwn { content: "PWN-SECRET-NOEXT"; }`)
+	write("secretdir/index.css", `.pwn { content: "PWN-SECRET-INDEX"; }`)
+
+	files := `
+-- hugo.toml --
+disableKinds = ["taxonomy", "term", "rss", "sitemap", "robotsTXT", "section", "page"]
+theme = "mytheme"
+SECURITY
+-- themes/mytheme/hugo.toml --
+-- themes/mytheme/assets/css/main.scss --
+@import "IMPORT";
+-- themes/mytheme/assets/css/local.css --
+.local { content: "LOCAL-CSS"; }
+-- themes/mytheme/assets/css/sub/nested.css --
+@import "../../../../../../secretcss";
+-- layouts/all.html --
+{{ $css := resources.Get "css/main.scss" | css.Sass (dict "transpiler" "libsass") }}
+RESULT:<pre>{{ $css.Content }}</pre>
+`
+
+	build := func(c *qt.C, name, imp, security string) (*hugolib.IntegrationTestBuilder, error) {
+		workingDir := filepath.Join(base, name)
+		if runtime.GOOS != "windows" {
+			linkDir := filepath.Join(workingDir, "themes", "mytheme", "assets", "css")
+			c.Assert(os.MkdirAll(linkDir, 0o755), qt.IsNil)
+			c.Assert(os.Symlink(secretCSS, filepath.Join(linkDir, "linkcss.css")), qt.IsNil)
+		}
+		f := strings.ReplaceAll(files, "IMPORT", imp)
+		f = strings.ReplaceAll(f, "SECURITY", security)
+		return hugolib.NewIntegrationTestBuilder(
+			hugolib.IntegrationTestConfig{
+				T:           c,
+				TxtarString: f,
+				NeedsOsFS:   true,
+				WorkingDir:  workingDir,
+			},
+		).BuildE()
+	}
+
+	outsideErr := func(target string) string {
+		return `.*"[^"]*" resolves to "[^"]*` + target + `" outside the project.*allowRead.*`
+	}
+
+	c.Run("Relative import, css file", func(c *qt.C) {
+		_, err := build(c, "relativecss", "../../../../../secretcss", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr(`secretcss\.css`))
+	})
+
+	c.Run("Relative import, name as given", func(c *qt.C) {
+		_, err := build(c, "relativenoext", "../../../../../secretnoext", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr(`secretnoext`))
+	})
+
+	c.Run("Relative import, css index file", func(c *qt.C) {
+		_, err := build(c, "relativeindex", "../../../../../secretdir", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr(`index\.css`))
+	})
+
+	c.Run("Absolute import, css file", func(c *qt.C) {
+		_, err := build(c, "absolutecss", filepath.ToSlash(filepath.Join(base, "secretcss")), "")
+		c.Assert(err, qt.ErrorMatches, outsideErr(`secretcss\.css`))
+	})
+
+	c.Run("Symlink in theme, css file", func(c *qt.C) {
+		if runtime.GOOS == "windows" {
+			c.Skip("symlinks")
+		}
+		_, err := build(c, "symlinkcss", "linkcss", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr(`secretcss\.css`))
+	})
+
+	c.Run("Nested import in css file resolved by LibSASS", func(c *qt.C) {
+		_, err := build(c, "nestedcss", "sub/nested", "")
+		c.Assert(err, qt.ErrorMatches, outsideErr(`secretcss\.css`))
+	})
+
+	c.Run("Css file inside the project", func(c *qt.C) {
+		b, err := build(c, "localcss", "local", "")
+		c.Assert(err, qt.IsNil)
+		b.AssertFileContent("public/index.html", "LOCAL-CSS")
+	})
+
+	c.Run("Relative import, css file in allowRead", func(c *qt.C) {
+		b, err := build(c, "allowedcss", "../../../../../secretcss", `
+[security.node.permissions]
+allowRead = [".", ".."]
+`)
+		c.Assert(err, qt.IsNil)
+		b.AssertFileContent("public/index.html", "PWN-SECRET-CSS")
+	})
 }
