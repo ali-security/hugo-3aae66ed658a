@@ -131,6 +131,35 @@ var commonTestScriptsParam = testscript.Params{
 				fmt.Fprintf(ts.Stdout(), "%s %04o %s %s\n", fi.Mode(), fi.Mode().Perm(), fi.ModTime().Format(time.RFC3339Nano), fi.Name())
 			}
 		},
+		// tree lists a directory recursively to stdout.
+		"tree": func(ts *testscript.TestScript, neg bool, args []string) {
+			dirname := ts.MkAbs(args[0])
+
+			err := filepath.WalkDir(dirname, func(path string, d fs.DirEntry, err error) error {
+				if err != nil {
+					return err
+				}
+				rel, err := filepath.Rel(dirname, path)
+				if err != nil {
+					return err
+				}
+				if rel == "." {
+					fmt.Fprintln(ts.Stdout(), ".")
+					return nil
+				}
+				depth := strings.Count(rel, string(os.PathSeparator))
+				prefix := strings.Repeat("  ", depth) + "└─"
+				if d.IsDir() {
+					fmt.Fprintf(ts.Stdout(), "%s%s/\n", prefix, d.Name())
+				} else {
+					fmt.Fprintf(ts.Stdout(), "%s%s\n", prefix, d.Name())
+				}
+				return nil
+			})
+			if err != nil {
+				ts.Fatalf("%v", err)
+			}
+		},
 		// append appends to a file with a leading newline.
 		"append": func(ts *testscript.TestScript, neg bool, args []string) {
 			if len(args) < 2 {
@@ -177,6 +206,21 @@ var commonTestScriptsParam = testscript.Params{
 			err = os.WriteFile(filename, newContent, 0o644)
 			if err != nil {
 				ts.Fatalf("failed to write file: %v", err)
+			}
+		},
+		// ln creates a symlink, but throws an error on Windows.
+		"ln": func(ts *testscript.TestScript, neg bool, args []string) {
+			if runtime.GOOS == "windows" {
+				ts.Fatalf("ln is not supported on Windows")
+			}
+			if len(args) != 2 {
+				ts.Fatalf("usage: ln TARGET LINKNAME")
+			}
+			target := ts.MkAbs(args[0])
+			linkname := ts.MkAbs(args[1])
+			err := os.Symlink(target, linkname)
+			if err != nil {
+				ts.Fatalf("failed to create symlink: %v", err)
 			}
 		},
 
@@ -255,6 +299,10 @@ var commonTestScriptsParam = testscript.Params{
 				ok := err == nil != neg
 				if !ok {
 					ts.Fatalf("stat %s: %v", filename, err)
+				}
+				if ok && neg {
+					// OK.
+					continue
 				}
 				if fi.Size() == 0 {
 					ts.Fatalf("%s is empty", filename)
