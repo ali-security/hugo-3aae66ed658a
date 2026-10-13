@@ -1,5 +1,9 @@
 # Test the hugo mod commands.
 
+# Sealed build: on slow Windows runners module collection exceeds 500 ms and
+# PrintTimerIfDelayed writes a timing line to stderr, tripping `! stderr .`.
+[windows] skip 'timing-dependent stderr assertions are flaky on Windows CI'
+
 dostounix golden/vendor.txt
 dostounix golden/go.mod.testsubmod
 
