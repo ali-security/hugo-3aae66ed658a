@@ -96,16 +96,22 @@ func TestStat(t *testing.T) {
 		{filepath.FromSlash("/f/f1.txt"), int64(10)},
 		{filepath.FromSlash("f/f1.txt"), int64(10)},
 		{"b", nil},
-		{"", nil},
+		{"", false},
 	} {
 		result, err := ns.Stat(test.filename)
 
-		if test.expect == nil {
+		if bb, ok := test.expect.(bool); ok && !bb {
 			b.Assert(err, qt.Not(qt.IsNil))
 			continue
 		}
 
 		b.Assert(err, qt.IsNil)
+
+		if test.expect == nil {
+			b.Assert(result, qt.IsNil)
+			continue
+		}
+
 		b.Assert(result.Size(), qt.Equals, test.expect)
 	}
 }

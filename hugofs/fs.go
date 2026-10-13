@@ -242,6 +242,8 @@ func WrapFilesystem(container, content afero.Fs) afero.Fs {
 	return filesystemsWrapper{Fs: container, content: content}
 }
 
+var _ afero.Lstater = (*filesystemsWrapper)(nil)
+
 type filesystemsWrapper struct {
 	afero.Fs
 	content afero.Fs
@@ -251,12 +253,46 @@ func (w filesystemsWrapper) UnwrapFilesystem() afero.Fs {
 	return w.content
 }
 
+func (w filesystemsWrapper) LstatIfPossible(name string) (os.FileInfo, bool, error) {
+	if _, ok := w.Fs.(*afero.ReadOnlyFs); ok {
+		// The read-only container does not change the file names,
+		// so Lstat the content filesystem directly. This makes sure
+		// that an overlayfs.OverlayFs below gets Lstat'ed, see lstatIfPossible.
+		return lstatIfPossible(w.content, name)
+	}
+	if lstater, ok := w.Fs.(afero.Lstater); ok {
+		return lstater.LstatIfPossible(name)
+	}
+	fi, err := w.Fs.Stat(name)
+	return fi, false, err
+}
+
 // LstatIfPossible tries to use LstatIfPossible if the filesystem supports it, otherwise it falls back to Stat.
 func LstatIfPossible(fs afero.Fs, name string) (os.FileInfo, error) {
+	fi, _, err := lstatIfPossible(fs, name)
+	return fi, err
+}
+
+func lstatIfPossible(fs afero.Fs, name string) (os.FileInfo, bool, error) {
+	if ofs, ok := fs.(*overlayfs.OverlayFs); ok {
+		// The LstatIfPossible implementation in the overlayfs version we
+		// depend on always follows symlinks (it calls Stat),
+		// so we need to walk the overlay's filesystems ourselves.
+		return lstatOverlayFs(ofs, name)
+	}
 	if lstater, ok := fs.(afero.Lstater); ok {
-		fi, _, err := lstater.LstatIfPossible(name)
-		return fi, err
+		return lstater.LstatIfPossible(name)
 	}
 	fi, err := fs.Stat(name)
-	return fi, err
+	return fi, false, err
+}
+
+// lstatOverlayFs checks the filesystems in ofs in order until name is found.
+func lstatOverlayFs(ofs *overlayfs.OverlayFs, name string) (os.FileInfo, bool, error) {
+	for i := range ofs.NumFilesystems() {
+		if fi, ok, err := lstatIfPossible(ofs.Filesystem(i), name); err == nil || !os.IsNotExist(err) {
+			return fi, ok, err
+		}
+	}
+	return nil, false, os.ErrNotExist
 }
