@@ -51,7 +51,7 @@ module.exports = {
 disablekinds = ['taxonomy', 'term', 'page']
 [security]
 	[security.exec]
-	allow = ['^npx$', '^babel$']
+	allow = ['^node$', '^babel$']
 -- layouts/index.html --
 {{ $options := dict "noComments" true }}
 {{ $transpiled := resources.Get "js/main.js" | babel -}}
